@@ -2320,7 +2320,7 @@ bool Connection::ParseMCBatch() {
           break;
       }
     }
-  } while (parsed_cmd_q_len_ < 128 && io_buf_.InputLen() > 0);
+  } while (/* TODO: fix it later parsed_cmd_q_len_ < 128 && */ io_buf_.InputLen() > 0);
   return true;
 }
 
@@ -2695,11 +2695,12 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     }
 
     if (pending_input_) {
-      // Drain available socket data into io_buf_.
-      io::MutableBytes buf = io_buf_.AppendBuffer();
-      // A recv call can return fewer bytes than requested even if the
-      // socket buffer actually contains enough data to satisfy the full request.
-      while (!buf.empty()) {
+      // Drain available socket data into io_buf_. After each read, ParseFromBuffer
+      // eagerly consumes all input, so we can grow the buffer before the next recv.
+      while (true) {
+        io::MutableBytes buf = io_buf_.AppendBuffer();
+        if (buf.empty())
+          break;
         io::Result<size_t> res = socket_->TryRecv(buf);
         if (!res || *res == 0) {
           if (res) {
@@ -2717,12 +2718,13 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
         }
         io_buf_.CommitWrite(*res);
         ParseFromBuffer();
-        buf = io_buf_.AppendBuffer();
+        CHECK_EQ(io_buf_.InputLen(), 0u);
+        CheckIoBufCapacity(io_buf_.AppendLen() == 0);
       }
     }
 
-    // Data is parsed eagerly (in the drain loop and DoReadOnRecv), so the await
-    // only needs to wait for commands to become executable/replyable or new data.
+    // Data is parsed eagerly above, so the await only needs to wait for
+    // commands to become executable/replyable, new data, or errors.
     // io_buf_.InputLen() > 0 is still needed for the multishot recv path.
     io_event_.await([this]() {
       return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() ||
@@ -2730,14 +2732,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     });
 
     phase_ = PROCESS;
-    bool is_iobuf_full = io_buf_.AppendLen() == 0;
 
-    // ParseFromBuffer was already called eagerly, but ParseMCBatch caps the queue.
-    // If the buffer still has data, parse the next batch before executing.
-    if (io_buf_.InputLen() > 0)
-      ParseFromBuffer();
-
-    parse_status = NEED_MORE;
     if (HasCommandToExecute()) {
       if (!ExecuteBatch())
         parse_status = ERROR;
@@ -2756,12 +2751,8 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       return std::exchange(io_ec_, {});
     }
 
-    if (parse_status == NEED_MORE) {
-      parse_status = OK;
-      CheckIoBufCapacity(is_iobuf_full);
-    } else if (parse_status != OK) {
+    if (parse_status != OK)
       break;
-    }
   } while (peer->IsOpen());
 
   return parse_status;
