@@ -1093,7 +1093,7 @@ void Connection::ConnectionFlow() {
   if (io_buf_.InputLen() > 0) {
     phase_ = PROCESS;
     if (redis_parser_) {
-      parse_status = ParseRedis(10000);
+      parse_status = ParseRedis(io_buf_, 10000);
     } else {
       DCHECK(memcache_parser_);
       parse_status = ParseLoop();
@@ -1252,7 +1252,8 @@ void Connection::DispatchSingle(bool has_more, absl::FunctionRef<void()> invoke_
   }
 }
 
-Connection::ParserStatus Connection::ParseRedis(unsigned max_busy_cycles, bool enqueue_only) {
+Connection::ParserStatus Connection::ParseRedis(base::IoBuf& io_buf, unsigned max_busy_cycles,
+                                                bool enqueue_only) {
   uint32_t consumed = 0;
   RespSrvParser::Result result = RespSrvParser::OK;
 
@@ -1330,10 +1331,10 @@ Connection::ParserStatus Connection::ParseRedis(unsigned max_busy_cycles, bool e
   return ERROR;
 }
 
-void Connection::ParseFromBuffer() {
+void Connection::ParseFromBuffer(base::IoBuf& buf) {
   auto parse_func =
       protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
-  (this->*parse_func)();
+  (this->*parse_func)(buf);
 }
 
 auto Connection::ParseLoop() -> ParserStatus {
@@ -1342,7 +1343,7 @@ auto Connection::ParseLoop() -> ParserStatus {
 
   bool commands_parsed = false;
   do {
-    commands_parsed = (this->*parse_func)();
+    commands_parsed = (this->*parse_func)(io_buf_);
 
     if (!ExecuteBatch())
       return ERROR;
@@ -1454,7 +1455,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoop() {
     bool is_iobuf_full = io_buf_.AppendLen() == 0;
 
     if (redis_parser_) {
-      parse_status = ParseRedis(max_busy_read_cycles_cached);
+      parse_status = ParseRedis(io_buf_, max_busy_read_cycles_cached);
     } else {
       DCHECK(memcache_parser_);
       parse_status = ParseLoop();
@@ -2268,12 +2269,12 @@ bool Connection::IsReplySizeOverLimit() const {
   return over_limit;
 }
 
-bool Connection::ParseRedisBatch() {
-  return ParseRedis(max_busy_read_cycles_cached, true) == ParserStatus::OK;
+bool Connection::ParseRedisBatch(base::IoBuf& buf) {
+  return ParseRedis(buf, max_busy_read_cycles_cached, true) == ParserStatus::OK;
 }
 
-bool Connection::ParseMCBatch() {
-  CHECK(io_buf_.InputLen() > 0);
+bool Connection::ParseMCBatch(base::IoBuf& io_buf) {
+  CHECK(io_buf.InputLen() > 0);
 
   do {
     if (parsed_cmd_ == nullptr) {
@@ -2283,9 +2284,9 @@ bool Connection::ParseMCBatch() {
     }
     uint32_t consumed = 0;
     memcache_parser_->set_last_unix_time(time(nullptr));
-    MemcacheParser::Result result = memcache_parser_->Parse(io::View(io_buf_.InputBuffer()),
+    MemcacheParser::Result result = memcache_parser_->Parse(io::View(io_buf.InputBuffer()),
                                                             &consumed, parsed_cmd_->mc_command());
-    io_buf_.ConsumeInput(consumed);
+    io_buf.ConsumeInput(consumed);
 
     DVLOG(2) << "mc_result " << unsigned(result) << " consumed: " << consumed << " type "
              << unsigned(parsed_cmd_->mc_command()->type);
@@ -2320,7 +2321,7 @@ bool Connection::ParseMCBatch() {
           break;
       }
     }
-  } while (/* TODO: fix it later parsed_cmd_q_len_ < 128 && */ io_buf_.InputLen() > 0);
+  } while (/* TODO: fix it later parsed_cmd_q_len_ < 128 && */ io_buf.InputLen() > 0);
   return true;
 }
 
@@ -2603,17 +2604,17 @@ void Connection::DoReadOnRecv(const util::FiberSocketBase::RecvNotification& n) 
     io::MutableBytes buf = std::get<io::MutableBytes>(n.read_result);
     UpdateIoBufCapacity(io_buf_, &tl_facade_stats->conn_stats,
                         [&]() { io_buf_.WriteAndCommit(buf.data(), buf.size()); });
-    ParseFromBuffer();
+    ParseFromBuffer(io_buf_);
   } else {
     LOG(FATAL) << "Should not reach here";
   }
 }
 
-void Connection::CheckIoBufCapacity(bool is_iobuf_full) {
+void Connection::CheckIoBufCapacity(base::IoBuf& io_buf, bool is_iobuf_full) {
   auto& conn_stats = tl_facade_stats->conn_stats;
   size_t max_io_buf_len = GetFlag(FLAGS_max_client_iobuf_len);
 
-  size_t capacity = io_buf_.Capacity();
+  size_t capacity = io_buf.Capacity();
   if (capacity < max_io_buf_len) {
     size_t parser_hint = 0;
     if (redis_parser_)
@@ -2625,23 +2626,23 @@ void Connection::CheckIoBufCapacity(bool is_iobuf_full) {
     // (Note: The buffer object is only working in power-of-2 sizes,
     // so there's no danger of accidental O(n^2) behavior.)
     if (parser_hint > capacity) {
-      UpdateIoBufCapacity(io_buf_, &conn_stats,
-                          [&]() { io_buf_.Reserve(std::min(max_io_buf_len, parser_hint)); });
+      UpdateIoBufCapacity(io_buf, &conn_stats,
+                          [&]() { io_buf.Reserve(std::min(max_io_buf_len, parser_hint)); });
     }
 
     // If we got a partial request because iobuf was full, grow it up to
     // a reasonable limit to save on Recv() calls.
     if (is_iobuf_full && capacity < max_io_buf_len / 2) {
       // Last io used most of the io_buf to the end.
-      UpdateIoBufCapacity(io_buf_, &conn_stats, [&]() {
-        io_buf_.Reserve(capacity * 2);  // Valid growth range.
+      UpdateIoBufCapacity(io_buf, &conn_stats, [&]() {
+        io_buf.Reserve(capacity * 2);  // Valid growth range.
       });
     }
 
-    if (io_buf_.AppendLen() == 0U) {
+    if (io_buf.AppendLen() == 0U) {
       // it can happen with memcached but not for RedisParser, because RedisParser fully
       // consumes the passed buffer
-      LOG_EVERY_T(WARNING, 10) << "Maximum io_buf length reached " << io_buf_.Capacity()
+      LOG_EVERY_T(WARNING, 10) << "Maximum io_buf length reached " << io_buf.Capacity()
                                << ", consider to increase max_client_iobuf_len flag";
     }
   }
@@ -2717,9 +2718,10 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
           break;
         }
         io_buf_.CommitWrite(*res);
-        ParseFromBuffer();
+        bool was_full = io_buf_.AppendLen() == 0;
+        ParseFromBuffer(io_buf_);
         CHECK_EQ(io_buf_.InputLen(), 0u);
-        CheckIoBufCapacity(io_buf_.AppendLen() == 0);
+        CheckIoBufCapacity(io_buf_, was_full);
       }
     }
 

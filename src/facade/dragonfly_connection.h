@@ -279,7 +279,7 @@ class Connection : public util::Connection {
 
   void DoReadOnRecv(const util::FiberSocketBase::RecvNotification& n);
 
-  void CheckIoBufCapacity(bool is_iobuf_full);
+  void CheckIoBufCapacity(base::IoBuf& buf, bool is_iobuf_full);
 
   // Main loop reading client messages and passing requests to dispatch queue.
   std::variant<std::error_code, ParserStatus> IoLoopV2();
@@ -311,7 +311,7 @@ class Connection : public util::Connection {
   // If add is true, stats are incremented, otherwise decremented.
   void UpdateDispatchStats(const MessageHandle& msg, bool add);
 
-  ParserStatus ParseRedis(unsigned max_busy_cycles, bool enqueue_only = false);
+  ParserStatus ParseRedis(base::IoBuf& buf, unsigned max_busy_cycles, bool enqueue_only = false);
 
   void OnBreakCb(int32_t mask);
 
@@ -358,13 +358,13 @@ class Connection : public util::Connection {
   // Returns true if one or more commands were parsed from the read buffer,
   // and false if no complete commands could be parsed (for example, when
   // parsing is pending more input).
-  bool ParseMCBatch();
+  bool ParseMCBatch(base::IoBuf& buf);
 
-  bool ParseRedisBatch();
+  bool ParseRedisBatch(base::IoBuf& buf);
 
   // Call the appropriate ParseMCBatch or ParseRedisBatch based on the protocol.
   // Only CPU-bound work; must not perform I/O or fiber suspension.
-  void ParseFromBuffer();
+  void ParseFromBuffer(base::IoBuf& buf);
 
   // Call appropriate ParseBatch function, proceed with Execute and Reply all why input is remaining
   ParserStatus ParseLoop();
