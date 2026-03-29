@@ -1330,6 +1330,12 @@ Connection::ParserStatus Connection::ParseRedis(unsigned max_busy_cycles, bool e
   return ERROR;
 }
 
+void Connection::ParseFromBuffer() {
+  auto parse_func =
+      protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
+  (this->*parse_func)();
+}
+
 auto Connection::ParseLoop() -> ParserStatus {
   auto parse_func =
       protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
@@ -2597,6 +2603,7 @@ void Connection::DoReadOnRecv(const util::FiberSocketBase::RecvNotification& n) 
     io::MutableBytes buf = std::get<io::MutableBytes>(n.read_result);
     UpdateIoBufCapacity(io_buf_, &tl_facade_stats->conn_stats,
                         [&]() { io_buf_.WriteAndCommit(buf.data(), buf.size()); });
+    ParseFromBuffer();
   } else {
     LOG(FATAL) << "Should not reach here";
   }
@@ -2709,39 +2716,40 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
           break;
         }
         io_buf_.CommitWrite(*res);
+        ParseFromBuffer();
         buf = io_buf_.AppendBuffer();
       }
     }
 
-    if (io_buf_.InputLen() == 0) {
-      io_event_.await([this]() {
-        // TODO: optimize CanReply with looking up waiter key
-        // io_buf_.InputLen() > 0 is still needed for multishot flow.
-        return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() ||
-               (parsed_head_ && parsed_head_->CanReply()) || io_ec_;
-      });
-    }
+    // Data is parsed eagerly (in the drain loop and DoReadOnRecv), so the await
+    // only needs to wait for commands to become executable/replyable or new data.
+    // io_buf_.InputLen() > 0 is still needed for the multishot recv path.
+    io_event_.await([this]() {
+      return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() ||
+             (parsed_head_ && parsed_head_->CanReply()) || io_ec_;
+    });
 
     phase_ = PROCESS;
     bool is_iobuf_full = io_buf_.AppendLen() == 0;
 
-    if (io_buf_.InputLen() > 0) {
-      parse_status = ParseLoop();
-    } else {
-      parse_status = NEED_MORE;
+    // ParseFromBuffer was already called eagerly, but ParseMCBatch caps the queue.
+    // If the buffer still has data, parse the next batch before executing.
+    if (io_buf_.InputLen() > 0)
+      ParseFromBuffer();
 
-      if (parsed_head_) {
-        if (HasCommandToExecute())
-          ExecuteBatch();
-        ReplyBatch();
-      }
+    parse_status = NEED_MORE;
+    if (HasCommandToExecute()) {
+      if (!ExecuteBatch())
+        parse_status = ERROR;
     }
+    if (parse_status != ERROR && !ReplyBatch())
+      parse_status = ERROR;
 
     if (reply_builder_->GetError()) {
       return reply_builder_->GetError();
     }
 
-    // Check io_ec_ after parsing and flushing replies, so that half-closed
+    // Check io_ec_ after executing and flushing replies, so that half-closed
     // connections get their responses before we close.
     if (io_ec_) {
       LOG_IF(WARNING, cntx()->replica_conn) << "async io error: " << io_ec_;
